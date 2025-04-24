@@ -1,4 +1,4 @@
-# Linux Kernel Module Rootkit Framework
+# Linux Kernel Module Rootkit Thesis
 
 ## Overview
 
@@ -8,7 +8,7 @@ This repository contains the implementation of various Linux Kernel Module (LKM)
 
 ## Academic Purpose
 
-> **Note:** This code is developed strictly for educational and research purposes. All testing should be performed in isolated environments.
+This code is developed strictly for educational and research purposes. All testing should be performed in isolated environments.
 
 ---
 
@@ -16,10 +16,8 @@ This repository contains the implementation of various Linux Kernel Module (LKM)
 
 - **Basic kernel module concealment techniques**
 - **Process hiding capabilities**
-- **File and directory hiding (prefix-based)**
 - **Advanced syscall hooking using ftrace**
 - **Persistence mechanisms**
-- **Port hiding for network services**
 
 ---
 
