@@ -1,0 +1,15 @@
+The Following code has been added respectively in order to init the rootkit at compile time:
+
+Samples Kconfig:
+----------------------------------------------
+config SAMPLE_ROOTKIT
+	bool "Build a sample rootkit"
+	help
+	  Build sample rootkit for thesis.
+----------------------------------------------
+
+
+Samples Makefile:
+----------------------------------------------
+obj-$(CONFIG_SAMPLE_ROOTKIT)	+= dkom_rootkit/
+----------------------------------------------
